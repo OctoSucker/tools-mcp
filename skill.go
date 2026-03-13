@@ -239,7 +239,6 @@ func RegisterMCPSkill(registry *tools.ToolRegistry, agent interface{}) error {
 			parts = append(parts, fmt.Sprintf("%s:0(connect/list failed)", ent.ID))
 		}
 	}
-	log.Printf("skill-mcp: registered %d tool(s) total [%s]", total, strings.Join(parts, ", "))
 	return nil
 }
 

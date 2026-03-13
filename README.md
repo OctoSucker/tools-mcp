@@ -1,21 +1,34 @@
-# skill-mcp
+# tools-mcp
 
-将 MCP (Model Context Protocol) 服务器的工具暴露给 OctoSucker Agent，使 LLM 可调用任意 MCP 服务（如 OpenBB、Exa、OpenNews 等）提供的工具。
+将 MCP (Model Context Protocol) 服务器的工具暴露给 OctoSucker Agent，使 LLM 可调用任意 MCP 服务（如 Exa、Context7、OpenBB 等）提供的工具。
+
+## 工具
+
+- **按 server 动态注册**：每个配置的 server 在加载时会连接 MCP、拉取 `ListTools`，将远端每个工具注册为本地 Tool，名称为 `mcp_{id}_{工具名}`（例如 `mcp_exa_search`、`mcp_context7_*`）。
+- **元信息工具（每个 server）**：`mcp_{id}_meta` — 返回该 server 的 id、url、transport、description、setup、工具数量；server 离线时也可调用。
+- **聚合工具**：`mcp_list_servers` — 返回所有已配置的 MCP server 及其工具列表（id、url、transport、description、setup、tools），供 LLM 了解当前可用的 MCP 能力。
+
+未配置 `servers` 或列表为空时，不注册任何 MCP 工具。
 
 ## 配置
 
-在 Agent 的 `skills` 配置中为 `github.com/OctoSucker/skill-mcp` 指定 `servers` 列表，每项包含：
+在 Agent 配置的 `tool_providers["github.com/OctoSucker/tools-mcp"]` 下指定 `servers` 列表，每项包含：
 
-- **id**: 服务器标识，用于生成工具名前缀（如 `mcp_exa_web_search_exa`）
-- **url**: MCP 端点 URL
-- **transport**（可选）：`streamable`（默认）或 `sse`。若连 OpenBB/FastMCP 出现 400，可改为 `sse`，并让服务端用 `--transport sse` 启动。
+| 键 | 说明 |
+|------|------|
+| `id` | 服务器标识（必填），用于生成工具名前缀，如 `mcp_exa_search`。 |
+| `url` | MCP 端点 URL（必填，stdio 已不支持）。 |
+| `transport` | 可选：`streamable`（默认）或 `sse`。若连 OpenBB/FastMCP 出现 400，可改为 `sse`。 |
+| `description` | 可选，服务器描述。 |
+| `setup` | 可选，字符串数组，说明如何启动/配置该 MCP 服务。 |
 
-示例：
+示例（`config/agent_config.json`）：
 
 ```json
-"github.com/OctoSucker/skill-mcp": {
+"github.com/OctoSucker/tools-mcp": {
   "servers": [
     { "id": "exa", "url": "https://mcp.exa.ai/mcp" },
+    { "id": "context7", "url": "https://mcp.context7.com/mcp" },
     { "id": "openbb", "url": "http://127.0.0.1:8001/mcp", "transport": "sse" }
   ]
 }
@@ -23,51 +36,28 @@
 
 ## 行为
 
-- **Init**：解析 `servers`，不建立连接。
-- **Register**：对每个 server 连接 MCP、拉取 `ListTools`，将每个远端工具注册为本地 Tool，名称为 `mcp_{id}_{工具名}`，描述与参数来自 MCP。
-- **调用**：Agent 调用 `mcp_*` 时，Skill 再连接对应 MCP、执行 `CallTool`，将结果返回给 Agent。
-
-单次调用采用「按需连接」：每次执行工具时新建连接并调用，结束后关闭，避免长连接与 SDK 已知的 transient error 问题。
+- **Init**：仅解析 `servers`，不建立连接。
+- **Register**：对每个 server 连接 MCP、拉取 `ListTools`，将每个远端工具注册为 `mcp_{id}_{工具名}`，并注册 `mcp_{id}_meta`；最后注册 `mcp_list_servers`。`transport` 为 `stdio` 的 server 会被跳过（已不支持）。
+- **调用**：Agent 调用 `mcp_*` 时按需连接对应 MCP、执行 `CallTool`，将结果返回。单次调用采用「按需连接」，结束后关闭，避免长连接问题。
 
 ## 依赖
 
-- [modelcontextprotocol/go-sdk](https://github.com/modelcontextprotocol/go-sdk)（官方 Go MCP SDK，Streamable HTTP 客户端）
+- [modelcontextprotocol/go-sdk](https://github.com/modelcontextprotocol/go-sdk)（官方 Go MCP SDK，Streamable HTTP / SSE 客户端）
 
 ## 示例 MCP 服务
 
-- **Exa 搜索**：`https://mcp.exa.ai/mcp`（免 API Key 有额度）
-- **OpenBB**：见下方「接入 OpenBB」小节
-- 其他支持 Streamable HTTP 的 MCP 服务均可按上述格式加入 `servers`
+- **Exa 搜索**：`https://mcp.exa.ai/mcp`
+- **Context7**：`https://mcp.context7.com/mcp`
+- **OpenBB**：需本地启动 `openbb-mcp --transport sse --port 8001`，配置 `"url": "http://127.0.0.1:8001/mcp", "transport": "sse"`
 
----
+其他支持 Streamable HTTP 或 SSE 的 MCP 服务均可按上述格式加入 `servers`。
 
-## 接入 OpenBB（[OpenBB-finance/OpenBB](https://github.com/OpenBB-finance/OpenBB)）
+## 安装
 
-OpenBB 是金融数据平台（股票、ETF、宏观、衍生品等），通过 **openbb-mcp-server** 暴露 MCP 工具，可与 skill-mcp 对接。
+主项目中：
 
-### 步骤
+```bash
+go get github.com/OctoSucker/tools-mcp@latest
+```
 
-1. **安装并启动 OpenBB MCP 服务**（需 Python 3.9–3.12）：
-
-   ```bash
-   pip install "openbb[all]"
-   pip install openbb-mcp-server
-   openbb-mcp --transport sse --port 8001
-   ```
-
-   **重要**：OpenBB 默认的 streamable-http 与 Go MCP 客户端握手时可能返回 400，建议用 **SSE**：`--transport sse`。端点以启动日志 `on http://...` 为准（如 `http://127.0.0.1:8001/mcp`），配置时 URL 须含完整路径。
-
-2. **在 OctoSucker 中配置 skill-mcp**（`agent_config.json`）：
-
-   ```json
-   "github.com/OctoSucker/skill-mcp": {
-     "servers": [
-       { "id": "openbb", "url": "http://127.0.0.1:8001/mcp", "transport": "sse" }
-     ]
-   }
-   ```
-   若用 SSE 启动 openbb-mcp，此处必须加 `"transport": "sse"`。
-
-3. 启动 OctoSucker Agent。加载时会对 OpenBB 做 `ListTools`，所有 OpenBB 工具会以 `mcp_openbb_*` 形式注册，供 LLM 调用（如查股价、宏观指标等）。
-
-说明：`openbb-api` 提供的是 REST API（默认 6900 端口），不是 MCP；要经 skill-mcp 接入需使用 **openbb-mcp**（上述命令）。
+并保留空白导入：`_ "github.com/OctoSucker/tools-mcp"`。
