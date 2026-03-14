@@ -31,12 +31,12 @@ type mcpToolMeta struct {
 	Parameters  map[string]interface{}
 }
 
-type SkillMCP struct {
+type Provider struct {
 	mu      sync.RWMutex
 	servers []serverEntry
 }
 
-func (s *SkillMCP) Init(config map[string]interface{}) error {
+func (s *Provider) Init(config map[string]interface{}) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.servers = nil
@@ -85,7 +85,7 @@ func (s *SkillMCP) Init(config map[string]interface{}) error {
 	return nil
 }
 
-func (s *SkillMCP) Cleanup() error {
+func (s *Provider) Cleanup() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.servers = nil
@@ -93,7 +93,7 @@ func (s *SkillMCP) Cleanup() error {
 	return nil
 }
 
-func (s *SkillMCP) getServers() []serverEntry {
+func (s *Provider) getServers() []serverEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]serverEntry, len(s.servers))
@@ -101,7 +101,7 @@ func (s *SkillMCP) getServers() []serverEntry {
 	return out
 }
 
-func (s *SkillMCP) getServerMeta(id string) map[string]interface{} {
+func (s *Provider) getServerMeta(id string) map[string]interface{} {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, e := range s.servers {
@@ -121,10 +121,10 @@ func (s *SkillMCP) getServerMeta(id string) map[string]interface{} {
 	}
 }
 
-var globalSkillMCP *SkillMCP
+var globalProvider *Provider
 
 func RegisterMCPSkill(registry *tools.ToolRegistry, agent interface{}) error {
-	servers := globalSkillMCP.getServers()
+	servers := globalProvider.getServers()
 	if len(servers) == 0 {
 		log.Printf("skill-mcp: no servers in config, skipping tool registration")
 		return nil
@@ -166,9 +166,9 @@ func RegisterMCPSkill(registry *tools.ToolRegistry, agent interface{}) error {
 			})
 		}
 	}
-	globalSkillMCP.mu.Lock()
-	globalSkillMCP.servers = servers
-	globalSkillMCP.mu.Unlock()
+	globalProvider.mu.Lock()
+	globalProvider.servers = servers
+	globalProvider.mu.Unlock()
 
 	total := 0
 	for _, ent := range servers {
@@ -204,7 +204,7 @@ func RegisterMCPSkill(registry *tools.ToolRegistry, agent interface{}) error {
 		Description: "返回所有已配置的 MCP server 及其工具列表（id, url, transport, description, setup, tools）。",
 		Parameters:  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
 		Handler: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-			servers := globalSkillMCP.getServers()
+			servers := globalProvider.getServers()
 			out := make([]map[string]interface{}, 0, len(servers))
 			for _, s := range servers {
 				tools := make([]map[string]interface{}, 0, len(s.Tools))
@@ -248,13 +248,13 @@ func toolName(serverID, name string) string {
 
 func makeMCPHandler(serverID, toolNameVal string) tools.ToolHandler {
 	return func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-		return globalSkillMCP.callTool(ctx, serverID, toolNameVal, params)
+		return globalProvider.callTool(ctx, serverID, toolNameVal, params)
 	}
 }
 
 func makeMCPMetaHandler(serverID string) tools.ToolHandler {
 	return func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-		return globalSkillMCP.getServerMeta(serverID), nil
+		return globalProvider.getServerMeta(serverID), nil
 	}
 }
 
@@ -262,7 +262,7 @@ const defaultConnectTimeout = 15 * time.Second
 const defaultListTimeout = 10 * time.Second
 const defaultCallTimeout = 60 * time.Second
 
-func (s *SkillMCP) callTool(ctx context.Context, serverID, toolNameVal string, params map[string]interface{}) (interface{}, error) {
+func (s *Provider) callTool(ctx context.Context, serverID, toolNameVal string, params map[string]interface{}) (interface{}, error) {
 	var serverURL, serverTransport string
 	for _, e := range s.getServers() {
 		if e.ID == serverID {
@@ -349,9 +349,9 @@ func inputSchemaToParameters(schema interface{}) map[string]interface{} {
 }
 
 func init() {
-	globalSkillMCP = &SkillMCP{}
+	globalProvider = &Provider{}
 	tools.RegisterToolProviderWithMetadata(providerName, tools.ToolProviderMetadata{
 		Name:        providerName,
 		Description: "Expose MCP server tools to the agent (Exa, etc.)",
-	}, RegisterMCPSkill, globalSkillMCP)
+	}, RegisterMCPSkill, globalProvider)
 }
