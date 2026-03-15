@@ -2,10 +2,7 @@ module github.com/OctoSucker/tools-mcp
 
 go 1.25.4
 
-require (
-	github.com/OctoSucker/octosucker-tools v0.0.0-20260313143338-cd2656c207cc
-	github.com/modelcontextprotocol/go-sdk v1.4.0
-)
+require github.com/modelcontextprotocol/go-sdk v1.4.0
 
 require (
 	github.com/google/jsonschema-go v0.4.2 // indirect

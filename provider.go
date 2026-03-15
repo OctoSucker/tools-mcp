@@ -3,20 +3,19 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	tools "github.com/OctoSucker/octosucker-tools"
 	mcpkg "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const providerName = "github.com/OctoSucker/tools-mcp"
-
-type serverEntry struct {
+type MCPClient struct {
 	ID          string
 	URL         string
 	Transport   string
@@ -31,22 +30,29 @@ type mcpToolMeta struct {
 	Parameters  map[string]interface{}
 }
 
-type Provider struct {
-	mu      sync.RWMutex
-	servers []serverEntry
+type MCPRegistry struct {
+	mu       sync.RWMutex
+	clients  []MCPClient
+	sessions map[string]*mcpkg.ClientSession
+	http     *http.Client
 }
 
-func (s *Provider) Init(config map[string]interface{}) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.servers = nil
-	if config == nil {
-		log.Printf("tools-mcp: no config, no MCP servers configured")
+func NewMCPRegistry() *MCPRegistry {
+	return &MCPRegistry{
+		sessions: make(map[string]*mcpkg.ClientSession),
+		http:     &http.Client{},
+	}
+}
+
+func (r *MCPRegistry) Init(servers []map[string]interface{}) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closeAllSessionsLocked()
+	r.clients = nil
+	if len(servers) == 0 {
 		return nil
 	}
-	raw, _ := config["servers"].([]interface{})
-	for _, x := range raw {
-		m, _ := x.(map[string]interface{})
+	for _, m := range servers {
 		if m == nil {
 			continue
 		}
@@ -74,7 +80,7 @@ func (s *Provider) Init(config map[string]interface{}) error {
 			continue
 		}
 
-		s.servers = append(s.servers, serverEntry{
+		r.clients = append(r.clients, MCPClient{
 			ID:          id,
 			URL:         url,
 			Transport:   transport,
@@ -85,26 +91,205 @@ func (s *Provider) Init(config map[string]interface{}) error {
 	return nil
 }
 
-func (s *Provider) Cleanup() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.servers = nil
+func LoadAllMCPProviders(registry *MCPRegistry, servers []map[string]interface{}) map[string]error {
+	if registry == nil || len(servers) == 0 {
+		return nil
+	}
+	if err := registry.Init(servers); err != nil {
+		return map[string]error{"mcp": err}
+	}
+	if err := registry.LoadTools(); err != nil {
+		return map[string]error{"mcp": err}
+	}
+	return nil
+}
+
+func (r *MCPRegistry) Cleanup() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closeAllSessionsLocked()
+	r.clients = nil
 	log.Printf("tools-mcp: cleaned up")
 	return nil
 }
 
-func (s *Provider) getServers() []serverEntry {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]serverEntry, len(s.servers))
-	copy(out, s.servers)
+func (r *MCPRegistry) getClients() []MCPClient {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]MCPClient, len(r.clients))
+	copy(out, r.clients)
 	return out
 }
 
-func (s *Provider) getServerMeta(id string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, e := range s.servers {
+const defaultConnectTimeout = 15 * time.Second
+const defaultListTimeout = 10 * time.Second
+const defaultCallTimeout = 60 * time.Second
+
+func (r *MCPRegistry) LoadTools() error {
+	clients := r.getClients()
+	if len(clients) == 0 {
+		return nil
+	}
+	for i := range clients {
+		ent := &clients[i]
+		ent.Tools = nil
+		session, err := r.getOrCreateSession(context.Background(), ent.ID)
+		if err != nil {
+			log.Printf("tools-mcp: connect to %s (%s) failed: %v", ent.ID, ent.URL, err)
+			continue
+		}
+		listCtx, listCancel := context.WithTimeout(context.Background(), defaultListTimeout)
+		res, err := session.ListTools(listCtx, nil)
+		listCancel()
+		if err != nil {
+			r.dropSession(ent.ID)
+			log.Printf("tools-mcp: list tools %s failed: %v", ent.ID, err)
+			continue
+		}
+		for _, t := range res.Tools {
+			ent.Tools = append(ent.Tools, mcpToolMeta{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  inputSchemaToParameters(&t.InputSchema),
+			})
+		}
+	}
+	r.mu.Lock()
+	r.clients = clients
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *MCPRegistry) GetAllTools() []map[string]interface{} {
+	clients := r.getClients()
+	var out []map[string]interface{}
+	for _, ent := range clients {
+		for _, tm := range ent.Tools {
+			name := toolName(ent.ID, tm.Name)
+			params := tm.Parameters
+			if params == nil {
+				params = map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
+			}
+			out = append(out, map[string]interface{}{
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":        name,
+					"description": tm.Description,
+					"parameters":  params,
+				},
+			})
+		}
+		metaName := toolName(ent.ID, "_meta")
+		out = append(out, map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        metaName,
+				"description": fmt.Sprintf("Get MCP server %s metadata, including description and setup instructions. This works even if the MCP server is offline.", ent.ID),
+				"parameters":  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+			},
+		})
+	}
+	out = append(out, map[string]interface{}{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":        "mcp_list_servers",
+			"description": "返回所有已配置的 MCP server 及其工具列表（id, url, transport, description, setup, tools）。",
+			"parameters":  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		},
+	})
+	return out
+}
+
+func (r *MCPRegistry) ExecuteTool(ctx context.Context, name string, argumentsJSON string) (interface{}, error) {
+	var params map[string]interface{}
+	if argumentsJSON != "" {
+		if err := json.Unmarshal([]byte(argumentsJSON), &params); err != nil {
+			return nil, fmt.Errorf("mcp: invalid tool arguments: %w", err)
+		}
+	}
+	if params == nil {
+		params = make(map[string]interface{})
+	}
+
+	if name == "mcp_list_servers" {
+		return r.executeListServers(), nil
+	}
+	if strings.HasPrefix(name, "mcp_") {
+		serverID, toolNameVal, ok := r.parseQualifiedToolName(name)
+		if ok {
+			if toolNameVal == "_meta" {
+				return r.getServerMeta(serverID), nil
+			}
+			return r.callTool(ctx, serverID, toolNameVal, params)
+		}
+	}
+	return nil, fmt.Errorf("mcp: tool %q not found", name)
+}
+
+func (r *MCPRegistry) parseQualifiedToolName(name string) (serverID string, toolName string, ok bool) {
+	if !strings.HasPrefix(name, "mcp_") {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(name, "mcp_")
+	clients := r.getClients()
+	if len(clients) == 0 {
+		return "", "", false
+	}
+	var ids []string
+	for _, c := range clients {
+		if strings.TrimSpace(c.ID) != "" {
+			ids = append(ids, c.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return "", "", false
+	}
+	// prefer longest prefix, supports server IDs containing underscores
+	sort.SliceStable(ids, func(i, j int) bool { return len(ids[i]) > len(ids[j]) })
+	for _, id := range ids {
+		prefix := id + "_"
+		if strings.HasPrefix(rest, prefix) {
+			tool := strings.TrimPrefix(rest, prefix)
+			if tool == "" {
+				return "", "", false
+			}
+			return id, tool, true
+		}
+	}
+	return "", "", false
+}
+
+func (r *MCPRegistry) executeListServers() map[string]interface{} {
+	clients := r.getClients()
+	out := make([]map[string]interface{}, 0, len(clients))
+	for _, s := range clients {
+		tools := make([]map[string]interface{}, 0, len(s.Tools))
+		for _, t := range s.Tools {
+			tools = append(tools, map[string]interface{}{
+				"name":        t.Name,
+				"description": t.Description,
+			})
+		}
+		out = append(out, map[string]interface{}{
+			"id":          s.ID,
+			"url":         s.URL,
+			"transport":   s.Transport,
+			"description": s.Description,
+			"setup":       s.Setup,
+			"tools":       tools,
+			"toolsCount":  len(tools),
+		})
+	}
+	return map[string]interface{}{
+		"servers": out,
+		"count":   len(out),
+	}
+}
+
+func (r *MCPRegistry) getServerMeta(id string) map[string]interface{} {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, e := range r.clients {
 		if e.ID == id {
 			return map[string]interface{}{
 				"server_id":   e.ID,
@@ -121,177 +306,15 @@ func (s *Provider) getServerMeta(id string) map[string]interface{} {
 	}
 }
 
-var globalProvider *Provider
-
-func RegisterMCPSkill(registry *tools.ToolRegistry, agent interface{}) error {
-	servers := globalProvider.getServers()
-	if len(servers) == 0 {
-		log.Printf("tools-mcp: no servers in config, skipping tool registration")
-		return nil
-	}
-	client := mcpkg.NewClient(&mcpkg.Implementation{Name: "octosucker-mcp-skill", Version: "1.0.0"}, nil)
-	httpClient := &http.Client{}
-	for i := range servers {
-		ent := &servers[i]
-		var transport mcpkg.Transport
-		switch ent.Transport {
-		case "sse":
-			transport = &mcpkg.SSEClientTransport{Endpoint: ent.URL, HTTPClient: httpClient}
-		case "stdio":
-			log.Printf("tools-mcp: server %s uses stdio transport which is no longer supported, skipping", ent.ID)
-			continue
-		default:
-			transport = &mcpkg.StreamableClientTransport{Endpoint: ent.URL, HTTPClient: httpClient}
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), defaultConnectTimeout)
-		session, err := client.Connect(ctx, transport, nil)
-		cancel()
-		if err != nil {
-			log.Printf("tools-mcp: connect to %s (%s) failed: %v", ent.ID, ent.URL, err)
-			continue
-		}
-		listCtx, listCancel := context.WithTimeout(context.Background(), defaultListTimeout)
-		res, err := session.ListTools(listCtx, nil)
-		listCancel()
-		_ = session.Close()
-		if err != nil {
-			log.Printf("tools-mcp: list tools %s failed: %v", ent.ID, err)
-			continue
-		}
-		for _, t := range res.Tools {
-			ent.Tools = append(ent.Tools, mcpToolMeta{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  inputSchemaToParameters(&t.InputSchema),
-			})
-		}
-	}
-	globalProvider.mu.Lock()
-	globalProvider.servers = servers
-	globalProvider.mu.Unlock()
-
-	total := 0
-	for _, ent := range servers {
-		for _, tm := range ent.Tools {
-			name := toolName(ent.ID, tm.Name)
-			params := tm.Parameters
-			if params == nil {
-				params = map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
-			}
-			serverID, toolNameVal := ent.ID, tm.Name
-			registry.Register(&tools.Tool{
-				Name:        name,
-				Description: tm.Description,
-				Parameters:  params,
-				Handler:     makeMCPHandler(serverID, toolNameVal),
-			})
-			total++
-		}
-
-		metaName := toolName(ent.ID, "_meta")
-		registry.Register(&tools.Tool{
-			Name:        metaName,
-			Description: fmt.Sprintf("Get MCP server %s metadata, including description and setup instructions. This works even if the MCP server is offline.", ent.ID),
-			Parameters:  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
-			Handler:     makeMCPMetaHandler(ent.ID),
-		})
-		total++
-	}
-
-	// 额外注册一个聚合工具：返回所有已注册的 MCP server 及其工具列表
-	registry.Register(&tools.Tool{
-		Name:        "mcp_list_servers",
-		Description: "返回所有已配置的 MCP server 及其工具列表（id, url, transport, description, setup, tools）。",
-		Parameters:  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
-		Handler: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-			servers := globalProvider.getServers()
-			out := make([]map[string]interface{}, 0, len(servers))
-			for _, s := range servers {
-				tools := make([]map[string]interface{}, 0, len(s.Tools))
-				for _, t := range s.Tools {
-					tools = append(tools, map[string]interface{}{
-						"name":        t.Name,
-						"description": t.Description,
-					})
-				}
-				out = append(out, map[string]interface{}{
-					"id":          s.ID,
-					"url":         s.URL,
-					"transport":   s.Transport,
-					"description": s.Description,
-					"setup":       s.Setup,
-					"tools":       tools,
-					"toolsCount":  len(tools),
-				})
-			}
-			return map[string]interface{}{
-				"servers": out,
-				"count":   len(out),
-			}, nil
-		},
-	})
-
-	var parts []string
-	for _, ent := range servers {
-		if len(ent.Tools) > 0 {
-			parts = append(parts, fmt.Sprintf("%s:%d", ent.ID, len(ent.Tools)))
-		} else {
-			parts = append(parts, fmt.Sprintf("%s:0(connect/list failed)", ent.ID))
-		}
-	}
-	return nil
-}
-
 func toolName(serverID, name string) string {
 	return "mcp_" + serverID + "_" + name
 }
 
-func makeMCPHandler(serverID, toolNameVal string) tools.ToolHandler {
-	return func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-		return globalProvider.callTool(ctx, serverID, toolNameVal, params)
-	}
-}
-
-func makeMCPMetaHandler(serverID string) tools.ToolHandler {
-	return func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-		return globalProvider.getServerMeta(serverID), nil
-	}
-}
-
-const defaultConnectTimeout = 15 * time.Second
-const defaultListTimeout = 10 * time.Second
-const defaultCallTimeout = 60 * time.Second
-
-func (s *Provider) callTool(ctx context.Context, serverID, toolNameVal string, params map[string]interface{}) (interface{}, error) {
-	var serverURL, serverTransport string
-	for _, e := range s.getServers() {
-		if e.ID == serverID {
-			serverURL = e.URL
-			serverTransport = e.Transport
-			break
-		}
-	}
-	if serverURL == "" {
-		return nil, fmt.Errorf("mcp server %q not found", serverID)
-	}
-	client := mcpkg.NewClient(&mcpkg.Implementation{Name: "octosucker-mcp-skill", Version: "1.0.0"}, nil)
-	httpClient := &http.Client{}
-	var transport mcpkg.Transport
-	switch serverTransport {
-	case "sse":
-		transport = &mcpkg.SSEClientTransport{Endpoint: serverURL, HTTPClient: httpClient}
-	case "stdio":
-		return nil, fmt.Errorf("mcp server %q uses stdio transport which is no longer supported", serverID)
-	default:
-		transport = &mcpkg.StreamableClientTransport{Endpoint: serverURL, HTTPClient: httpClient}
-	}
-	connectCtx, connectCancel := context.WithTimeout(ctx, defaultConnectTimeout)
-	session, err := client.Connect(connectCtx, transport, nil)
-	connectCancel()
+func (r *MCPRegistry) callTool(ctx context.Context, serverID, toolNameVal string, params map[string]interface{}) (interface{}, error) {
+	session, err := r.getOrCreateSession(ctx, serverID)
 	if err != nil {
-		return nil, fmt.Errorf("mcp connect to %s: %w", serverID, err)
+		return nil, err
 	}
-	defer session.Close()
 	args := make(map[string]any)
 	for k, v := range params {
 		args[k] = v
@@ -299,6 +322,17 @@ func (s *Provider) callTool(ctx context.Context, serverID, toolNameVal string, p
 	callCtx, callCancel := context.WithTimeout(ctx, defaultCallTimeout)
 	res, err := session.CallTool(callCtx, &mcpkg.CallToolParams{Name: toolNameVal, Arguments: args})
 	callCancel()
+	if err != nil {
+		if errors.Is(err, mcpkg.ErrConnectionClosed) {
+			r.dropSession(serverID)
+			session, reconnectErr := r.getOrCreateSession(ctx, serverID)
+			if reconnectErr == nil {
+				callCtx2, cancel2 := context.WithTimeout(ctx, defaultCallTimeout)
+				res, err = session.CallTool(callCtx2, &mcpkg.CallToolParams{Name: toolNameVal, Arguments: args})
+				cancel2()
+			}
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("mcp call_tool %s/%s: %w", serverID, toolNameVal, err)
 	}
@@ -348,10 +382,74 @@ func inputSchemaToParameters(schema interface{}) map[string]interface{} {
 	return m
 }
 
-func init() {
-	globalProvider = &Provider{}
-	tools.RegisterToolProviderWithMetadata(providerName, tools.ToolProviderMetadata{
-		Name:        providerName,
-		Description: "Expose MCP server tools to the agent (Exa, etc.)",
-	}, RegisterMCPSkill, globalProvider)
+func (r *MCPRegistry) getClientByID(serverID string) (MCPClient, bool) {
+	for _, c := range r.getClients() {
+		if c.ID == serverID {
+			return c, true
+		}
+	}
+	return MCPClient{}, false
+}
+
+func (r *MCPRegistry) getOrCreateSession(ctx context.Context, serverID string) (*mcpkg.ClientSession, error) {
+	r.mu.RLock()
+	if s := r.sessions[serverID]; s != nil {
+		r.mu.RUnlock()
+		return s, nil
+	}
+	r.mu.RUnlock()
+
+	clientCfg, ok := r.getClientByID(serverID)
+	if !ok {
+		return nil, fmt.Errorf("mcp server %q not found", serverID)
+	}
+	transport, err := r.newTransport(clientCfg)
+	if err != nil {
+		return nil, err
+	}
+	connectCtx, cancel := context.WithTimeout(ctx, defaultConnectTimeout)
+	defer cancel()
+	client := mcpkg.NewClient(&mcpkg.Implementation{Name: "octosucker-mcp", Version: "1.0.0"}, nil)
+	session, err := client.Connect(connectCtx, transport, nil)
+	if err != nil {
+		return nil, fmt.Errorf("mcp connect to %s: %w", serverID, err)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if existing := r.sessions[serverID]; existing != nil {
+		_ = session.Close()
+		return existing, nil
+	}
+	r.sessions[serverID] = session
+	return session, nil
+}
+
+func (r *MCPRegistry) newTransport(clientCfg MCPClient) (mcpkg.Transport, error) {
+	switch clientCfg.Transport {
+	case "sse":
+		return &mcpkg.SSEClientTransport{Endpoint: clientCfg.URL, HTTPClient: r.http}, nil
+	case "stdio":
+		return nil, fmt.Errorf("mcp server %q uses stdio transport which is no longer supported", clientCfg.ID)
+	default:
+		return &mcpkg.StreamableClientTransport{Endpoint: clientCfg.URL, HTTPClient: r.http}, nil
+	}
+}
+
+func (r *MCPRegistry) dropSession(serverID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s := r.sessions[serverID]; s != nil {
+		_ = s.Close()
+		delete(r.sessions, serverID)
+	}
+}
+
+func (r *MCPRegistry) closeAllSessionsLocked() {
+	for id, s := range r.sessions {
+		if s != nil {
+			_ = s.Close()
+		}
+		delete(r.sessions, id)
+	}
 }
